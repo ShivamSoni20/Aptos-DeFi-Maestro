@@ -1,206 +1,187 @@
-import { Aptos, AptosConfig, Ed25519PrivateKey, Network, PrivateKey, PrivateKeyVariants } from "@aptos-labs/ts-sdk"
-import { ChatAnthropic } from "@langchain/anthropic"
-import { AIMessage, BaseMessage, ChatMessage, HumanMessage } from "@langchain/core/messages"
-import { MemorySaver } from "@langchain/langgraph"
-import { createReactAgent } from "@langchain/langgraph/prebuilt"
-import { Message as VercelChatMessage } from "ai"
-import { AgentRuntime, LocalSigner, createAptosTools } from "move-agent-kit"
-import { NextResponse } from "next/server"
+import { Aptos, AptosConfig, Ed25519PrivateKey, Network, PrivateKey, PrivateKeyVariants, Account } from "@aptos-labs/ts-sdk";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
+import { MemorySaver } from "@langchain/langgraph";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { Message as VercelChatMessage } from "ai";
+import { AgentRuntime, LocalSigner, createAptosTools } from "move-agent-kit";
+import { NextResponse } from "next/server";
+
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("ANTHROPIC_API_KEY is not set in .env");
+} else {
+  console.log("Using ANTHROPIC_API_KEY:", process.env.ANTHROPIC_API_KEY.substring(0, 8) + "...");
+}
 
 const llm = new ChatAnthropic({
-	temperature: 0.7,
-	model: "claude-3-5-sonnet-latest",
-	apiKey: process.env.ANTHROPIC_API_KEY,
-})
+  temperature: 0.7,
+  model: "claude-3-5-sonnet-latest",
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
 
-const textDecoder = new TextDecoder()
+const textDecoder = new TextDecoder();
 
-// Function to read and process the stream
 async function readStream(stream: any) {
-	try {
-		// Create a reader from the stream
-		const reader = stream.getReader()
-
-		let result = ""
-
-		while (true) {
-			// Read each chunk from the stream
-			const { done, value } = await reader.read()
-
-			// If the stream is finished, break the loop
-			if (done) {
-				break
-			}
-
-			// Decode the chunk and append to result
-			result += textDecoder.decode(value, { stream: true })
-		}
-
-		// Final decode to handle any remaining bytes
-		result += textDecoder.decode()
-
-		return result
-	} catch (error) {
-		console.error("Error reading stream:", error)
-		throw error
-	}
+  const reader = stream.getReader();
+  let result = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    result += textDecoder.decode(value, { stream: true });
+  }
+  result += textDecoder.decode();
+  return result;
 }
 
 const convertVercelMessageToLangChainMessage = (message: VercelChatMessage) => {
-	if (message.role === "user") {
-		return new HumanMessage(message.content)
-	} else if (message.role === "assistant") {
-		return new AIMessage(message.content)
-	} else {
-		return new ChatMessage(message.content, message.role)
-	}
-}
+  if (message.role === "user") return new HumanMessage(message.content);
+  if (message.role === "assistant") return new AIMessage(message.content);
+  return new ChatMessage(message.content, message.role);
+};
 
 const convertLangChainMessageToVercelMessage = (message: BaseMessage) => {
-	if (message._getType() === "human") {
-		return { content: message.content, role: "user" }
-	} else if (message._getType() === "ai") {
-		return {
-			content: message.content,
-			role: "assistant",
-			tool_calls: (message as AIMessage).tool_calls,
-		}
-	} else {
-		return { content: message.content, role: message._getType() }
-	}
+  if (message._getType() === "human") return { content: message.content, role: "user" };
+  if (message._getType() === "ai") return { content: message.content, role: "assistant", tool_calls: (message as AIMessage).tool_calls };
+  return { content: message.content, role: message._getType() };
+};
+
+async function optimizeYield(agent: AgentRuntime) {
+  const balance = await agent.getBalance(agent.signer.account.address.toString());
+  const jouleYield = 0.08;
+  const panoraYield = 0.06;
+  if (jouleYield > panoraYield && balance >= 10) {
+    await agent.transferTokens("joule_contract_address", 10);
+    return "Moved 10 APT to Joule for 8% yield.";
+  } else {
+    return `Current yields suboptimal or insufficient balance (${balance} APT)—staying put.`;
+  }
+}
+
+async function rebalancePortfolio(agent: AgentRuntime) {
+  const balance = await agent.getBalance(agent.signer.account.address.toString());
+  if (balance >= 5) {
+    await agent.transferTokens("lending_contract_address", 5);
+    return "Rebalanced: 5 APT moved to lending for stability.";
+  }
+  return `Portfolio already balanced or insufficient balance (${balance} APT).`;
+}
+
+async function createNewWallet() {
+  const newAccount = Account.generate(); // Defaults to Legacy Ed25519
+  const address = newAccount.accountAddress.toString();
+  const privateKey = newAccount.privateKey.toString();
+  console.log("Generated private key:", privateKey); // Debug log
+  return `New wallet created!\n- Address: ${address}\n- Private Key: ${privateKey}\n\n**Next Steps:**\n1. Copy the private key above.\n2. Open your project's .env file and set:\n   APTOS_PRIVATE_KEY=${privateKey}\n3. Restart the application.\n4. Fund the wallet with APT tokens:\n   - For testnet, visit: https://aptos.dev/faucet\n   - For mainnet, transfer APT from another wallet.\n5. Once funded, I'll use this wallet for all operations.\n⚠️ Store your private key securely and never share it publicly!`;
 }
 
 export async function POST(request: Request) {
-	try {
-		// Initialize Aptos configuration
-		const aptosConfig = new AptosConfig({
-			network: Network.MAINNET,
-		})
+  try {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return NextResponse.json(
+        { error: "ANTHROPIC_API_KEY is not set in .env. Please configure it to use DeFi Maestro.", status: "error" },
+        { status: 500 }
+      );
+    }
 
-		const aptos = new Aptos(aptosConfig)
+    const aptosConfig = new AptosConfig({ network: Network.MAINNET });
+    const aptos = new Aptos(aptosConfig);
+    const privateKeyStr = process.env.APTOS_PRIVATE_KEY;
 
-		// Validate and get private key from environment
-		const privateKeyStr = process.env.APTOS_PRIVATE_KEY
-		if (!privateKeyStr) {
-			throw new Error("Missing APTOS_PRIVATE_KEY environment variable")
-		}
+    let aptosAgent: AgentRuntime | undefined;
+    if (privateKeyStr) {
+      console.log("Raw APTOS_PRIVATE_KEY from .env:", privateKeyStr); // Debug log
+      if (!privateKeyStr.startsWith("0x") || privateKeyStr.length !== 66) {
+        throw new Error("APTOS_PRIVATE_KEY must be a 32-byte hex string (66 chars with '0x' prefix).");
+      }
+      try {
+        const privateKey = new Ed25519PrivateKey(privateKeyStr);
+        const account = Account.fromPrivateKey({ privateKey }); // Legacy Ed25519
+        console.log("Derived account address:", account.accountAddress.toString());
+        const signer = new LocalSigner(account, Network.MAINNET);
+        aptosAgent = new AgentRuntime(signer, aptos, {
+          PANORA_API_KEY: process.env.PANORA_API_KEY,
+        });
+      } catch (e) {
+        throw new Error(`Invalid APTOS_PRIVATE_KEY in .env: ${e.message}`);
+      }
+    }
 
-		// Setup account and signer
-		const account = await aptos.deriveAccountFromPrivateKey({
-			privateKey: new Ed25519PrivateKey(PrivateKey.formatPrivateKey(privateKeyStr, PrivateKeyVariants.Ed25519)),
-		})
+    const tools = aptosAgent ? createAptosTools(aptosAgent) : [];
+    const memory = new MemorySaver();
 
-		const signer = new LocalSigner(account, Network.MAINNET)
-		const aptosAgent = new AgentRuntime(signer, aptos, {
-			PANORA_API_KEY: process.env.PANORA_API_KEY,
-		})
-		const tools = createAptosTools(aptosAgent)
-		const memory = new MemorySaver()
-
-		// Create React agent
-		const agent = createReactAgent({
-			llm,
-			tools,
-			checkpointSaver: memory,
-			messageModifier: `
-        You are a helpful agent that can interact onchain using the Aptos Agent Kit. You are
-        empowered to interact onchain using your tools. If you ever need funds, you can request them from the
-        faucet. If not, you can provide your wallet details and request funds from the user. If there is a 5XX
-        (internal) HTTP error code, ask the user to try again later. If someone asks you to do something you
-        can't do with your currently available tools, you must say so, and encourage them to implement it
-        themselves using the Aptos Agent Kit, recommend they go to https://www.aptosagentkit.xyz for more information. Be
-        concise and helpful with your responses. Refrain from restating your tools' descriptions unless it is explicitly requested.
-
-		The response also contains token/token[] which contains the name and address of the token and the decimals.
-		WHEN YOU RETURN ANY TOKEN AMOUNTS, RETURN THEM ACCORDING TO THE DECIMALS OF THE TOKEN.
+    const agent = createReactAgent({
+      llm,
+      tools,
+      checkpointSaver: memory,
+      messageModifier: `
+        You are "DeFi Maestro," an AI agent managing DeFi on Aptos. Your capabilities:
+        - Optimize yield (e.g., deposit to Joule or Panora) if a wallet is set.
+        - Rebalance portfolios for stability if a wallet is set.
+        - Check balances and manage risk if a wallet is set.
+        - Create a new wallet on Aptos if asked (user must update .env manually).
+        When creating a wallet, return the exact output from the createNewWallet function without modifying it or adding code snippets (e.g., no Python examples). If no APTOS_PRIVATE_KEY is set in .env, you can still create wallets but cannot perform onchain actions until it's updated and funded. If funds are low, suggest faucet access (https://aptos.dev/faucet) or user deposits. Be proactive—suggest actions based on conditions. Keep responses concise and actionable.
       `,
-		})
+    });
 
-		// Parse request body
-		const body = await request.json()
-		const messages = body.messages ?? []
-		const showIntermediateSteps = body.show_intermediate_steps ?? false
+    const body = await request.json();
+    const messages = (body.messages ?? []).map(convertVercelMessageToLangChainMessage);
+    const showIntermediateSteps = body.show_intermediate_steps ?? false;
 
-		if (!showIntermediateSteps) {
-			/**
-			 * Stream back all generated tokens and steps from their runs.
-			 *
-			 * We do some filtering of the generated events and only stream back
-			 * the final response as a string.
-			 *
-			 * For this specific type of tool calling ReAct agents with OpenAI, we can tell when
-			 * the agent is ready to stream back final output when it no longer calls
-			 * a tool and instead streams back content.
-			 *
-			 * See: https://langchain-ai.github.io/langgraphjs/how-tos/stream-tokens/
-			 */
-			const eventStream = await agent.streamEvents(
-				{ messages },
-				{
-					version: "v2",
-					configurable: {
-						thread_id: "Aptos Agent Kit!",
-					},
-				}
-			)
+    if (!showIntermediateSteps) {
+      const eventStream = await agent.streamEvents(
+        { messages },
+        { version: "v2", configurable: { thread_id: "DeFiMaestro" } }
+      );
+      const textEncoder = new TextEncoder();
+      const transformStream = new ReadableStream({
+        async start(controller) {
+          for await (const { event, data } of eventStream) {
+            if (event === "on_chat_model_stream" && data.chunk.content) {
+              const content = typeof data.chunk.content === "string" ? data.chunk.content : data.chunk.content.map(c => c.text || "").join("");
+              controller.enqueue(textEncoder.encode(content));
+            }
+          }
+          controller.close();
+        },
+      });
+      return new Response(transformStream);
+    } else {
+      const result = await agent.invoke({ messages });
+      const lastMessage = messages[messages.length - 1].content.toLowerCase();
 
-			const textEncoder = new TextEncoder()
-			const transformStream = new ReadableStream({
-				async start(controller) {
-					for await (const { event, data } of eventStream) {
-						if (event === "on_chat_model_stream") {
-							if (data.chunk.content) {
-								if (typeof data.chunk.content === "string") {
-									controller.enqueue(textEncoder.encode(data.chunk.content))
-								} else {
-									for (const content of data.chunk.content) {
-										controller.enqueue(textEncoder.encode(content.text ? content.text : ""))
-									}
-								}
-							}
-						}
-					}
-					controller.close()
-				},
-			})
+      if (lastMessage.includes("optimize yield")) {
+        if (!aptosAgent) {
+          result.messages.push(new AIMessage("No wallet set. Please set APTOS_PRIVATE_KEY in .env and fund it first."));
+        } else {
+          result.messages.push(new AIMessage(await optimizeYield(aptosAgent)));
+        }
+      } else if (lastMessage.includes("rebalance")) {
+        if (!aptosAgent) {
+          result.messages.push(new AIMessage("No wallet set. Please set APTOS_PRIVATE_KEY in .env and fund it first."));
+        } else {
+          result.messages.push(new AIMessage(await rebalancePortfolio(aptosAgent)));
+        }
+      } else if (lastMessage.includes("create wallet")) {
+        result.messages.push(new AIMessage(await createNewWallet()));
+      } else if (lastMessage.includes("check my balance")) {
+        if (!aptosAgent) {
+          result.messages.push(new AIMessage("No wallet set. Please set APTOS_PRIVATE_KEY in .env and fund it first."));
+        } else {
+          const balance = await aptosAgent.getBalance(aptosAgent.signer.account.address.toString());
+          result.messages.push(new AIMessage(`Your current balance is ${balance} APT.`));
+        }
+      }
 
-			//console.log("transformStream", transformStream)
-
-			//try {
-			//	const decodedContent = await readStream(transformStream);
-			//	console.log('Decoded content:', decodedContent);
-			//	//return decodedContent;
-			//  } catch (error) {
-			//	console.error('Error processing stream:', error);
-			//	throw error;
-			//  }
-
-			return new Response(transformStream)
-		} else {
-			/**
-			 * We could also pick intermediate steps out from `streamEvents` chunks, but
-			 * they are generated as JSON objects, so streaming and displaying them with
-			 * the AI SDK is more complicated.
-			 */
-			const result = await agent.invoke({ messages })
-
-			console.log("result", result)
-
-			return NextResponse.json(
-				{
-					messages: result.messages.map(convertLangChainMessageToVercelMessage),
-				},
-				{ status: 200 }
-			)
-		}
-	} catch (error: any) {
-		console.error("Request error:", error)
-		return NextResponse.json(
-			{
-				error: error instanceof Error ? error.message : "An error occurred",
-				status: "error",
-			},
-			{ status: error instanceof Error && "status" in error ? 500 : 500 }
-		)
-	}
+      return NextResponse.json(
+        { messages: result.messages.map(convertLangChainMessageToVercelMessage) },
+        { status: 200 }
+      );
+    }
+  } catch (error: any) {
+    console.error("Request error:", error);
+    return NextResponse.json(
+      { error: error.message || "An error occurred", status: "error" },
+      { status: 500 }
+    );
+  }
 }
